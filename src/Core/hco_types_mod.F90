@@ -28,6 +28,9 @@ MODULE HCO_TYPES_MOD
 !
   USE HCO_Error_Mod
   USE HCO_Arr_Mod
+#if defined( MODEL_CESM )
+  USE pio, ONLY : file_desc_t
+#endif
 
   IMPLICIT NONE
   PUBLIC
@@ -297,6 +300,10 @@ MODULE HCO_TYPES_MOD
      INTEGER                 :: FileLun       = -1  ! LUN of file in archive
      CHARACTER(LEN=2023)     :: FileInArchive = ''  ! name of file in archive
      INTEGER                 :: Counter       =  0  ! ReadList read counter
+#if defined( MODEL_CESM )
+     TYPE(file_desc_t)       :: FilesPioFh         ! PIO cached file descriptor
+     LOGICAL                 :: FilesPioOpen = .FALSE. ! PIO file open flag
+#endif
   END TYPE RdList
 
   !-------------------------------------------------------------------------
