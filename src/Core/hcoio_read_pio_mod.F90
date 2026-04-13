@@ -140,6 +140,7 @@ CONTAINS
     USE HCOIO_MESSY_MOD,    ONLY : HCO_MESSY_REGRID
     USE HCO_INTERP_MOD,     ONLY : REGRID_MAPA2A
     USE HCO_INTERP_MOD,     ONLY : ModelLev_Check
+    USE hco_esmf_regrid_cache, ONLY : HcoDirectMode, HCO_ESMF_REGRID_DIRECT
     USE HCO_CLOCK_MOD,      ONLY : HcoClock_Get
     USE HCO_DIAGN_MOD,      ONLY : Diagn_Update
     USE HCO_EXTLIST_MOD,    ONLY : HCO_GetOpt
@@ -814,8 +815,12 @@ CONTAINS
 
     ! Check for missing values: set base emissions and masks to 0, and
     ! scale factors to 1. This will make sure that these entries will
-    ! be ignored.
-!!! CALL CheckMissVal ( Lct, ncArr )
+    ! be ignored. Required for the direct ESMF regrid path — without
+    ! this call, raw HCO_MISSVAL (-1e31) sentinels stay in ncArr and
+    ! get smeared into neighbor cells by the conservative regrid,
+    ! producing huge garbage values that downstream equality-based
+    ! MISSVAL detection fails to catch.
+    CALL CheckMissVal ( Lct, ncArr )
 
     !-----------------------------------------------------------------
     ! Eventually do interpolation between files. This is a pretty
@@ -899,8 +904,9 @@ CONTAINS
              RETURN
           ENDIF
 
-          ! Eventually fissing values
-!!!          CALL CheckMissVal ( Lct, ncArr2 )
+          ! Check for missing values (see comment at first CheckMissVal
+          ! call above — required for the direct ESMF regrid path).
+          CALL CheckMissVal ( Lct, ncArr2 )
 
           ! Calculate weights to be applied to ncArr2 and ncArr1. These
           ! weights are calculated based on the originally preferred
@@ -1051,8 +1057,9 @@ CONTAINS
                 RETURN
              ENDIF
 
-             ! Eventually fissing values
-!!!             CALL CheckMissVal ( Lct, ncArr2 )
+             ! Check for missing values (see comment at first CheckMissVal
+             ! call above — required for the direct ESMF regrid path).
+             CALL CheckMissVal ( Lct, ncArr2 )
 
              ! Add all values to ncArr
              ncArr = ncArr + ncArr2
@@ -1374,9 +1381,83 @@ CONTAINS
     ENDIF
 
     !-----------------------------------------------------------------
-    ! Use MESSy regridding
+    ! Direct mode: ESMF regridding to physics grid (bypasses both
+    ! MAP_A2A and MESSy). Horizontal regridding is done via ESMF
+    ! conservative method; vertical regridding is done separately
+    ! per-column using sigma-to-sigma interpolation.
     !-----------------------------------------------------------------
-    IF ( UseMESSy ) THEN
+    IF ( HcoDirectMode ) THEN
+       IF ( HcoState%Config%doVerbose ) THEN
+          WRITE(MSG,*) '  ==> Direct mode: ESMF regridding to physics grid'
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
+       ! SigEdge preparation for 3D data still needs to happen.
+       ! The code above (lines ~1412-1503 in legacy path) prepares SigEdge
+       ! for IsModelLevel and real-coordinate data. For direct mode with 3D
+       ! data, we replicate the same SigEdge preparation here.
+       IF ( nlev > 1 ) THEN
+#if defined( MODEL_CESM ) || defined( MODEL_WRF )
+          ! For GEOS-Chem level data, build SigEdge from hardcoded table
+          IF ( IsModelLevel ) THEN
+             ALLOCATE(SigEdge(nlon, nlat, nlev+1))
+             DO I = 1, nlon
+                DO J = 1, nlat
+                   SigEdge(I, J, :) = GC_72_EDGE_SIGMA(1:nlev+1)
+                ENDDO
+             ENDDO
+          ENDIF
+#endif
+          ! For real-coordinate data, read sigma from file
+          IF ( .NOT. IsModelLevel ) THEN
+             CALL NC_Get_Sigma_Levels ( fID     = ncLun,   &
+                                        ncFile  = srcFile, &
+                                        levName = LevName, &
+                                        lon1    = 1,       &
+                                        lon2    = nlon,    &
+                                        lat1    = 1,       &
+                                        lat2    = nlat,    &
+                                        lev1    = 1,       &
+                                        lev2    = nlev,    &
+                                        time    = tidx1,   &
+                                        SigLev  = SigLev,  &
+                                        Dir     = dir,     &
+                                        RC      = NCRC      )
+             IF ( NCRC /= 0 ) THEN
+                CALL HCO_ERROR( 'Cannot read sigma levels of '//TRIM(srcFile), RC )
+                RETURN
+             ENDIF
+
+             CALL SigmaMidToEdges ( HcoState, SigLev, SigEdge, RC )
+             IF ( RC /= HCO_SUCCESS ) THEN
+                 CALL HCO_ERROR( 'ERROR SigmaMidToEdges', RC, THISLOC=LOC )
+                 RETURN
+             ENDIF
+             IF ( ASSOCIATED(SigLev) ) DEALLOCATE(SigLev)
+
+             ! Flip vertical axis if needed
+             IF ( dir == -1 ) THEN
+                SigEdge(:,:,:  ) = SigEdge(:,:,SIZE(SigEdge,3):1:-1)
+                NcArr  (:,:,:,:) = NcArr  (:,:,nlev:1:-1,:)
+             ENDIF
+          ENDIF
+       ENDIF
+
+       ! Call the ESMF direct regridding dispatch
+       CALL HCO_ESMF_REGRID_DIRECT( HcoState, NcArr, LonEdge, LatEdge, &
+                                    SigEdge, Lct, IsModelLevel, RC )
+       IF ( RC /= HCO_SUCCESS ) THEN
+          CALL HCO_ERROR( 'ERROR in HCO_ESMF_REGRID_DIRECT', RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+
+       ! Cleanup SigEdge if allocated
+       IF ( ASSOCIATED(SigEdge) ) DEALLOCATE(SigEdge)
+
+    !-----------------------------------------------------------------
+    ! Legacy mode: Use MESSy regridding
+    !-----------------------------------------------------------------
+    ELSE IF ( UseMESSy ) THEN
        IF ( HcoState%Config%doVerbose ) THEN
           WRITE(MSG,*) '  ==> Use MESSy regridding (NCREGRID)'
           CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
