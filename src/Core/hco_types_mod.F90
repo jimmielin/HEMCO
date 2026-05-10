@@ -375,6 +375,20 @@ MODULE HCO_TYPES_MOD
      LOGICAL                     :: IsTouched ! Has container been touched yet?
      INTEGER                     :: Lats(2)   ! Latitude  range (masks only)
      INTEGER                     :: Lons(2)   ! Longitude range (masks only)
+     ! Performance cache for time-interpolated ('I') reads and for
+     ! bracket-unchanged skip of any cycle flag.
+     LOGICAL                     :: CacheValid
+     CHARACTER(LEN=1023)         :: CacheSrc   ! matches srcFile LEN in HCOIO_Read
+     INTEGER                     :: CacheTidx1
+     INTEGER                     :: CacheTidx2
+     ! Unit attribute of the cached data variable. Same-bracket cache
+     ! hits skip NC_READ_ARR (which normally returns the unit), so it
+     ! is restored from here. Matches thisUnit LEN in HCOIO_Read.
+     CHARACTER(LEN=255)          :: CacheUnit
+     ! Raw netCDF slices for I-flag (pre-regrid, pre-collapse). REAL*4
+     ! matches disk format; unallocated for non-INTER fields.
+     REAL*4, ALLOCATABLE         :: CacheSlice1(:,:,:,:)
+     REAL*4, ALLOCATABLE         :: CacheSlice2(:,:,:,:)
   END TYPE FileData
 
   !-------------------------------------------------------------------------

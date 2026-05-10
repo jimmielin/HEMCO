@@ -10,14 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added code blocks for MAPL3 code in development
 - Added C-preprocessor switches `USE_ESMF` and `MAPL3`
 - Added HEMCO I/O module using PIO (`hcoio_read_pio_mod.F90` and `hcoio_write_pio_mod.F90` stub) for coupling to CESM
+- Added a bracket-read cache on `FileData` (fields `CacheValid`, `CacheSrc`, `CacheTidx1`, `CacheTidx2`, `CacheUnit`, `CacheSlice1`, `CacheSlice2`) that stores the raw netCDF time slices used by time-interpolated (`I`-flag) reads in `HCOIO_Read`.
 
 ### Changed
 - Renamed subroutine `HCO_CopyFromIntnal_ESMF` to `HCO_CopyFromInternal_ESMF`
 - Renamed state objects `HcoState%IMPORT` and `HcoStateEXPORT` to `HcoState%importState` and `HcoState%exportState` respectively
+- `HCOIO_Read` (both `hcoio_read_std_mod.F90` and `hcoio_read_pio_mod.F90`) now caches the raw time slices of `I`-flag fields and re-blends them on every refresh, so consecutive refreshes with an unchanged bracket do no disk I/O and bracket advances by one slice only re-read the new upper slice. Non-`I` fields short-circuit the entire read path when the bracket is unchanged. The PIO mirror is what makes this perf win available to CESM/CAM-chem.
 
 ### Fixed
 - Fixed an error in `src/Shared/GeosUtil/hco_regrid_a2a_mod.F90` where an accumulator was uninitialized before reuse, which may inherit junk data from the previous iteration if the southmost source cell is not found
 - Fixed IF-block logic errors in `SrcFile_Parse` that led to incorrect time-cycling behavior
+- `HCOIO_Read` now applies an OR-mask when blending cached `I`-flag time slices: any pixel where either slice carries `HCO_MISSVAL` is marked missing in the blended output, preventing fractional-weight blends of a fill value with a real value from leaking garbage past the downstream `== HCO_MISSVAL` check. This affects fields whose valid-data mask varies across the interpolation bracket (e.g. seasonal coverage).
+- `HCOIO_Read` now re-applies `wgt1`/`wgt2` from `GET_TIMEIDX` on every refresh of an `I`-flag field. Previously the blended values were frozen into `V2`/`V3` at read time, so between re-reads (e.g. within a month for a monthly `I`-flag field refreshed hourly) the emission was not actually time-interpolated. Output for `I`-flag fields is no longer bit-identical to prior versions; values now genuinely interpolate within each bracket.
+- `HCOIO_Read` now applies the same `HCO_MISSVAL` OR-mask when interpolating an `I`-flag field across two separate files (the `wgt1 < 0` cross-file fallback). Previously this path blended fill values with real values, so a pixel missing in one file but valid in the other leaked garbage into the result. This was the cross-file sibling of the in-file single-side bracket leak.
+- `NC_READ_ARR` (`hco_ncdf_mod.F90` and its PIO counterpart in `hco_pio_mod.F90`) now detects `missing_value`/`_FillValue` before applying `scale_factor`/`add_offset`, per CF conventions, instead of after. For packed input files (those carrying a `scale_factor` or `add_offset` together with a fill/missing attribute) the previous order compared unpacked data against the raw packed fill value, so genuine fill pixels were never detected and leaked into the field (and the cached `I`-flag slices). Scaling is now restricted to non-missing pixels so the `MissValue` sentinel is preserved.
 
 #### Removed
 - Removed C-preprocessor switch `ESMF_`

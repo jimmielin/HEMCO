@@ -206,6 +206,13 @@ CONTAINS
     FileDta%IsInList     = .FALSE.
     FileDta%IsTouched    = .FALSE.
 
+    ! Bracket-read cache (see FileData type for description)
+    FileDta%CacheValid   = .FALSE.
+    FileDta%CacheSrc     = ''
+    FileDta%CacheTidx1   = -1
+    FileDta%CacheTidx2   = -1
+    FileDta%CacheUnit    = ''
+
   END SUBROUTINE FileData_Init
 !EOC
 !------------------------------------------------------------------------------
@@ -248,7 +255,16 @@ CONTAINS
        CALL HCO_ArrCleanup( FileDta%V3, DeepClean )
        CALL HCO_ArrCleanup( FileDta%V2, DeepClean )
        FileDta%nt = 0
-       
+
+       ! Invalidate and release bracket-read cache
+       IF ( ALLOCATED(FileDta%CacheSlice1) ) DEALLOCATE(FileDta%CacheSlice1)
+       IF ( ALLOCATED(FileDta%CacheSlice2) ) DEALLOCATE(FileDta%CacheSlice2)
+       FileDta%CacheValid = .FALSE.
+       FileDta%CacheSrc   = ''
+       FileDta%CacheTidx1 = -1
+       FileDta%CacheTidx2 = -1
+       FileDta%CacheUnit  = ''
+
        IF ( DeepClean ) THEN
           FileDta%tIDx => NULL()
           DEALLOCATE ( FileDta )

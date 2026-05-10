@@ -1037,44 +1037,13 @@ CONTAINS
     ENDIF
 
     ! ------------------------------------------
-    ! Eventually apply scale / offset factors
-    ! ------------------------------------------
-
-    ! Check for scale factor
-    a_name  = "scale_factor"
-    tmp_ierr = pio_inq_varid(fID, TRIM(v_name), tmp_varid)
-    IF (tmp_ierr /= PIO_NOERR) THEN
-       ReadAtt = .FALSE.
-    ELSE
-       tmp_ierr = pio_inq_att(fID, tmp_varid, TRIM(a_name), a_type, tmp_len)
-       ReadAtt = (tmp_ierr == PIO_NOERR)
-    ENDIF
-
-    IF ( ReadAtt ) THEN
-       pio_ierr = pio_inq_varid(fId, TRIM(v_name), pio_varid)
-       pio_ierr = pio_get_att(fId, pio_varid, TRIM(a_name), corr)
-       ncArr(:,:,:,:) = ncArr(:,:,:,:) * corr
-    ENDIF
-
-    ! Check for offset factor
-    a_name  = "add_offset"
-    tmp_ierr = pio_inq_varid(fID, TRIM(v_name), tmp_varid)
-    IF (tmp_ierr /= PIO_NOERR) THEN
-       ReadAtt = .FALSE.
-    ELSE
-       tmp_ierr = pio_inq_att(fID, tmp_varid, TRIM(a_name), a_type, tmp_len)
-       ReadAtt = (tmp_ierr == PIO_NOERR)
-    ENDIF
-
-    IF ( ReadAtt ) THEN
-       pio_ierr = pio_inq_varid(fId, TRIM(v_name), pio_varid)
-       pio_ierr = pio_get_att(fId, pio_varid, TRIM(a_name), corr)
-       ncArr(:,:,:,:) = ncArr(:,:,:,:) + corr
-    ENDIF
-
-    ! ------------------------------------------
-    ! Check for filling values
-    ! NOTE: Test for REAL*4 and REAL*8
+    ! Apply missing-value/fill and scale/offset attributes to the final
+    ! ncArr. Per CF conventions missing_value/_FillValue are stored in
+    ! packed (raw) units, so they must be detected BEFORE scale_factor/
+    ! add_offset are applied; scaling is then restricted to non-missing
+    ! pixels so the MissValue sentinel is preserved. This mirrors
+    ! NC_READ_ARR in hco_ncdf_mod.F90.
+    ! NOTE: Test for REAL*4 and REAL*8 fill attributes.
     ! ------------------------------------------
 
     ! Define missing value
@@ -1134,6 +1103,38 @@ CONTAINS
              ncArr = MissValue
           END WHERE
        ENDIF
+    ENDIF
+
+    ! Check for scale factor
+    a_name  = "scale_factor"
+    tmp_ierr = pio_inq_varid(fID, TRIM(v_name), tmp_varid)
+    IF (tmp_ierr /= PIO_NOERR) THEN
+       ReadAtt = .FALSE.
+    ELSE
+       tmp_ierr = pio_inq_att(fID, tmp_varid, TRIM(a_name), a_type, tmp_len)
+       ReadAtt = (tmp_ierr == PIO_NOERR)
+    ENDIF
+
+    IF ( ReadAtt ) THEN
+       pio_ierr = pio_inq_varid(fId, TRIM(v_name), pio_varid)
+       pio_ierr = pio_get_att(fId, pio_varid, TRIM(a_name), corr)
+       WHERE ( ncArr /= MissValue ) ncArr(:,:,:,:) = ncArr(:,:,:,:) * corr
+    ENDIF
+
+    ! Check for offset factor
+    a_name  = "add_offset"
+    tmp_ierr = pio_inq_varid(fID, TRIM(v_name), tmp_varid)
+    IF (tmp_ierr /= PIO_NOERR) THEN
+       ReadAtt = .FALSE.
+    ELSE
+       tmp_ierr = pio_inq_att(fID, tmp_varid, TRIM(a_name), a_type, tmp_len)
+       ReadAtt = (tmp_ierr == PIO_NOERR)
+    ENDIF
+
+    IF ( ReadAtt ) THEN
+       pio_ierr = pio_inq_varid(fId, TRIM(v_name), pio_varid)
+       pio_ierr = pio_get_att(fId, pio_varid, TRIM(a_name), corr)
+       WHERE ( ncArr /= MissValue ) ncArr(:,:,:,:) = ncArr(:,:,:,:) + corr
     ENDIF
 
     ! ------------------------------------------

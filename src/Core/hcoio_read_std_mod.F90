@@ -199,6 +199,12 @@ CONTAINS
     LOGICAL                       :: FOUND
     LOGICAL                       :: IsModelLevel
     LOGICAL                       :: DoReturn
+    LOGICAL                       :: isInterBlend
+    LOGICAL                       :: cacheHitBracket
+    LOGICAL                       :: cacheHitSlide
+    LOGICAL                       :: cacheShapeOk
+    LOGICAL                       :: useCache
+    INTEGER                       :: expLev
     INTEGER                       :: UnitTolerance
     INTEGER                       :: AreaFlag, TimeFlag
     REAL(dp)                      :: YMDhma,  YMDhmb, YMDhm1
@@ -263,6 +269,7 @@ CONTAINS
     tidx2b  =  0
     wgt1    =  0.0_sp
     wgt2    =  0.0_sp
+    useCache = .TRUE.  ! cleared on cross-file/averaging paths below
 
     ! Get unit tolerance set in configuration file
     UnitTolerance = HCO_UnitTolerance( HcoState%Config )
@@ -805,28 +812,265 @@ CONTAINS
        CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
     ENDIF
 
-    CALL NC_READ_ARR( fID     = ncLun,              &
-                      ncVar   = Lct%Dct%Dta%ncPara, &
-                      lon1    = 1,                  &
-                      lon2    = nlon,               &
-                      lat1    = 1,                  &
-                      lat2    = nlat,               &
-                      lev1    = lev1,               &
-                      lev2    = lev2,               &
-                      time1   = tidx1,              &
-                      time2   = tidx2,              &
-                      ncArr   = ncArr,              &
-                      varUnit = thisUnit,           &
-                      wgt1    = wgt1,               &
-                      wgt2    = wgt2,               &
-                      MissVal = HCO_MISSVAL,        &
-                      ArbIdx  = ArbIdx,             &
-                      RC      = NCRC                 )
+    !-----------------------------------------------------------------
+    ! Cache-aware data read.
+    !
+    ! For HCO_CFLAG_INTER fields, we split the classic two-slice
+    ! bracket read into two single-slice reads and cache the raw
+    ! slices on FileData. Subsequent refreshes can then
+    !   (a) skip all disk I/O and just re-blend from cache when the
+    !       bracket is unchanged (happens whenever a monthly 'I'
+    !       field sits in a higher-frequency ReadList); or
+    !   (b) slide: promote the previous upper slice to the new lower
+    !       and read only the new upper slice when the bracket
+    !       advances by one.
+    !
+    ! Blending is always done here against the currently valid
+    ! wgt1/wgt2 returned by GET_TIMEIDX, which also fixes the
+    ! stale-weight issue of the previous implementation (weights
+    ! were frozen into V2/V3 at read time, so between refreshes the
+    ! emission was not actually time-interpolated).
+    !
+    ! For non-INTER fields the call reduces to the original
+    ! NC_READ_ARR invocation, read fresh on every refresh.
+    !-----------------------------------------------------------------
+    isInterBlend = ( Lct%Dct%Dta%CycleFlag == HCO_CFLAG_INTER .AND.   &
+                     wgt1 >= 0.0_sp )
 
-    IF ( NCRC /= 0 ) THEN
-       MSG = 'Error encountered in routine "NC_Read_Arr" (#1)!'
-       CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
-       RETURN
+    ! Expected level dimension of the read array (match NC_READ_ARR
+    ! ncLev = max(l2-l1+1, 1))
+    IF ( lev1 > 0 ) THEN
+       expLev = ABS( lev2 - lev1 ) + 1
+    ELSE
+       expLev = 1
+    ENDIF
+
+    cacheShapeOk = .FALSE.
+    IF ( ALLOCATED(Lct%Dct%Dta%CacheSlice1) .AND.                     &
+         ALLOCATED(Lct%Dct%Dta%CacheSlice2) ) THEN
+       IF ( SIZE(Lct%Dct%Dta%CacheSlice1,1) == nlon   .AND.           &
+            SIZE(Lct%Dct%Dta%CacheSlice1,2) == nlat   .AND.           &
+            SIZE(Lct%Dct%Dta%CacheSlice1,3) == expLev .AND.           &
+            SIZE(Lct%Dct%Dta%CacheSlice2,1) == nlon   .AND.           &
+            SIZE(Lct%Dct%Dta%CacheSlice2,2) == nlat   .AND.           &
+            SIZE(Lct%Dct%Dta%CacheSlice2,3) == expLev       ) THEN
+          cacheShapeOk = .TRUE.
+       ENDIF
+    ENDIF
+
+    cacheHitBracket = .FALSE.
+    cacheHitSlide   = .FALSE.
+    IF ( isInterBlend                                      .AND.      &
+         Lct%Dct%Dta%CacheValid                            .AND.      &
+         TRIM(Lct%Dct%Dta%CacheSrc) == TRIM(srcFile)       .AND.      &
+         cacheShapeOk                                           ) THEN
+       IF ( Lct%Dct%Dta%CacheTidx1 == tidx1 .AND.                     &
+            Lct%Dct%Dta%CacheTidx2 == tidx2                  ) THEN
+          cacheHitBracket = .TRUE.
+       ELSEIF ( Lct%Dct%Dta%CacheTidx2 == tidx1 ) THEN
+          cacheHitSlide = .TRUE.
+       ENDIF
+    ENDIF
+
+    IF ( isInterBlend .AND. cacheHitBracket ) THEN
+
+       ! (a) Bracket unchanged -> re-blend from cached raw slices,
+       ! no disk I/O. Mark pixels missing if either cached slice was
+       ! a fill/missing value to avoid leaking garbage through the
+       ! fractional time blend.
+       ALLOCATE( ncArr( SIZE(Lct%Dct%Dta%CacheSlice1,1),              &
+                        SIZE(Lct%Dct%Dta%CacheSlice1,2),              &
+                        SIZE(Lct%Dct%Dta%CacheSlice1,3),              &
+                        SIZE(Lct%Dct%Dta%CacheSlice1,4) ) )
+       WHERE ( Lct%Dct%Dta%CacheSlice1 == HCO_MISSVAL .OR.            &
+               Lct%Dct%Dta%CacheSlice2 == HCO_MISSVAL )
+          ncArr = HCO_MISSVAL
+       ELSEWHERE
+          ncArr = wgt1 * Lct%Dct%Dta%CacheSlice1                      &
+                + wgt2 * Lct%Dct%Dta%CacheSlice2
+       END WHERE
+
+       ! NC_READ_ARR is skipped on this path, so restore the data
+       ! variable unit recorded when the slices were cached. thisUnit
+       ! otherwise still holds the latitude unit from the grid reads
+       ! above, which would corrupt the unit conversion below.
+       thisUnit = Lct%Dct%Dta%CacheUnit
+
+       IF ( HcoState%Config%doVerbose ) THEN
+          MSG = '  ==> I-flag cache hit (same bracket, re-blend)'
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
+    ELSEIF ( isInterBlend .AND. cacheHitSlide ) THEN
+
+       ! (b) Bracket advanced by one slice -> promote upper to lower
+       ! and read only the new upper slice.
+       CALL MOVE_ALLOC( Lct%Dct%Dta%CacheSlice2,                      &
+                        Lct%Dct%Dta%CacheSlice1 )
+
+       CALL NC_READ_ARR( fID     = ncLun,              &
+                         ncVar   = Lct%Dct%Dta%ncPara, &
+                         lon1    = 1,                  &
+                         lon2    = nlon,               &
+                         lat1    = 1,                  &
+                         lat2    = nlat,               &
+                         lev1    = lev1,               &
+                         lev2    = lev2,               &
+                         time1   = tidx2,              &
+                         time2   = tidx2,              &
+                         ncArr   = ncArr,              &
+                         varUnit = thisUnit,           &
+                         MissVal = HCO_MISSVAL,        &
+                         ArbIdx  = ArbIdx,             &
+                         RC      = NCRC                 )
+       IF ( NCRC /= 0 ) THEN
+          MSG = 'Error encountered in routine "NC_Read_Arr" (I-slide)!'
+          CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+
+       ALLOCATE( Lct%Dct%Dta%CacheSlice2(                             &
+                    SIZE(ncArr,1), SIZE(ncArr,2),                     &
+                    SIZE(ncArr,3), SIZE(ncArr,4) ) )
+       Lct%Dct%Dta%CacheSlice2 = ncArr
+
+       ! Blend in place into ncArr (shape matches CacheSlice1/2).
+       ! Mark missing where either cached slice was a fill value.
+       WHERE ( Lct%Dct%Dta%CacheSlice1 == HCO_MISSVAL .OR.            &
+               Lct%Dct%Dta%CacheSlice2 == HCO_MISSVAL )
+          ncArr = HCO_MISSVAL
+       ELSEWHERE
+          ncArr = wgt1 * Lct%Dct%Dta%CacheSlice1                      &
+                + wgt2 * Lct%Dct%Dta%CacheSlice2
+       END WHERE
+
+       Lct%Dct%Dta%CacheTidx1 = tidx1
+       Lct%Dct%Dta%CacheTidx2 = tidx2
+
+       IF ( HcoState%Config%doVerbose ) THEN
+          MSG = '  ==> I-flag cache slide (one-slice read)'
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
+    ELSEIF ( isInterBlend ) THEN
+
+       ! (c) Cache miss on an INTER read -> read both slices
+       ! separately, populate cache, then blend.
+       IF ( ALLOCATED(Lct%Dct%Dta%CacheSlice1) )                      &
+            DEALLOCATE(Lct%Dct%Dta%CacheSlice1)
+       IF ( ALLOCATED(Lct%Dct%Dta%CacheSlice2) )                      &
+            DEALLOCATE(Lct%Dct%Dta%CacheSlice2)
+
+       ! Lower slice
+       CALL NC_READ_ARR( fID     = ncLun,              &
+                         ncVar   = Lct%Dct%Dta%ncPara, &
+                         lon1    = 1,                  &
+                         lon2    = nlon,               &
+                         lat1    = 1,                  &
+                         lat2    = nlat,               &
+                         lev1    = lev1,               &
+                         lev2    = lev2,               &
+                         time1   = tidx1,              &
+                         time2   = tidx1,              &
+                         ncArr   = ncArr,              &
+                         varUnit = thisUnit,           &
+                         MissVal = HCO_MISSVAL,        &
+                         ArbIdx  = ArbIdx,             &
+                         RC      = NCRC                 )
+       IF ( NCRC /= 0 ) THEN
+          MSG = 'Error encountered in routine "NC_Read_Arr" (I-lower)!'
+          CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       ALLOCATE( Lct%Dct%Dta%CacheSlice1(                             &
+                    SIZE(ncArr,1), SIZE(ncArr,2),                     &
+                    SIZE(ncArr,3), SIZE(ncArr,4) ) )
+       Lct%Dct%Dta%CacheSlice1 = ncArr
+       DEALLOCATE(ncArr)
+
+       ! Upper slice
+       CALL NC_READ_ARR( fID     = ncLun,              &
+                         ncVar   = Lct%Dct%Dta%ncPara, &
+                         lon1    = 1,                  &
+                         lon2    = nlon,               &
+                         lat1    = 1,                  &
+                         lat2    = nlat,               &
+                         lev1    = lev1,               &
+                         lev2    = lev2,               &
+                         time1   = tidx2,              &
+                         time2   = tidx2,              &
+                         ncArr   = ncArr,              &
+                         varUnit = thisUnit,           &
+                         MissVal = HCO_MISSVAL,        &
+                         ArbIdx  = ArbIdx,             &
+                         RC      = NCRC                 )
+       IF ( NCRC /= 0 ) THEN
+          MSG = 'Error encountered in routine "NC_Read_Arr" (I-upper)!'
+          CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+       ALLOCATE( Lct%Dct%Dta%CacheSlice2(                             &
+                    SIZE(ncArr,1), SIZE(ncArr,2),                     &
+                    SIZE(ncArr,3), SIZE(ncArr,4) ) )
+       Lct%Dct%Dta%CacheSlice2 = ncArr
+
+       ! Blend in place into ncArr (shape matches CacheSlice1/2).
+       ! Mark missing where either cached slice was a fill value.
+       WHERE ( Lct%Dct%Dta%CacheSlice1 == HCO_MISSVAL .OR.            &
+               Lct%Dct%Dta%CacheSlice2 == HCO_MISSVAL )
+          ncArr = HCO_MISSVAL
+       ELSEWHERE
+          ncArr = wgt1 * Lct%Dct%Dta%CacheSlice1                      &
+                + wgt2 * Lct%Dct%Dta%CacheSlice2
+       END WHERE
+
+       Lct%Dct%Dta%CacheTidx1 = tidx1
+       Lct%Dct%Dta%CacheTidx2 = tidx2
+
+       IF ( HcoState%Config%doVerbose ) THEN
+          MSG = '  ==> I-flag cache miss (two-slice read)'
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
+    ELSE
+
+       ! Non-INTER (or INTER with wgt1<0 / cross-file fallback):
+       ! standard NC_READ_ARR. The ApplyWeights branch inside
+       ! NC_READ_ARR remains as a safety net for external callers
+       ! but is not exercised by the cache-aware paths above.
+       CALL NC_READ_ARR( fID     = ncLun,              &
+                         ncVar   = Lct%Dct%Dta%ncPara, &
+                         lon1    = 1,                  &
+                         lon2    = nlon,               &
+                         lat1    = 1,                  &
+                         lat2    = nlat,               &
+                         lev1    = lev1,               &
+                         lev2    = lev2,               &
+                         time1   = tidx1,              &
+                         time2   = tidx2,              &
+                         ncArr   = ncArr,              &
+                         varUnit = thisUnit,           &
+                         wgt1    = wgt1,               &
+                         wgt2    = wgt2,               &
+                         MissVal = HCO_MISSVAL,        &
+                         ArbIdx  = ArbIdx,             &
+                         RC      = NCRC                 )
+       IF ( NCRC /= 0 ) THEN
+          MSG = 'Error encountered in routine "NC_Read_Arr" (#1)!'
+          CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+          RETURN
+       ENDIF
+
+       IF ( HcoState%Config%doVerbose ) THEN
+          IF ( Lct%Dct%Dta%CacheValid .AND.                           &
+               TRIM(Lct%Dct%Dta%CacheSrc) == TRIM(srcFile) ) THEN
+             MSG = '  ==> Bracket cache miss (bracket changed)'
+          ELSE
+             MSG = '  ==> Bracket cache miss (first read or new file)'
+          ENDIF
+          CALL HCO_MSG(MSG,LUN=HcoState%Config%hcoLogLUN)
+       ENDIF
+
     ENDIF
 
     ! Check for missing values: set base emissions and masks to 0, and
@@ -843,6 +1087,10 @@ CONTAINS
     ! time is outside the file range.
     !-----------------------------------------------------------------
     IF ( Lct%Dct%Dta%CycleFlag == HCO_CFLAG_INTER .AND. wgt1 < 0.0_sp ) THEN
+
+       ! Cross-file interpolation is not covered by the bracket cache;
+       ! invalidate so the next refresh re-reads fresh.
+       useCache = .FALSE.
 
        ! No need to read another file if the previous file had exactly the
        ! time stamp we were looking for.
@@ -935,8 +1183,15 @@ CONTAINS
              wgt2 = 0.5_sp
           ENDIF
 
-          ! Apply weights
-          ncArr = (wgt1 * ncArr) + (wgt2 * ncArr2)
+          ! Apply weights. If either file has a fill/missing value at a
+          ! given location, keep the result as missing to avoid leaking
+          ! garbage through the fractional time blend (cf. single-side
+          ! bracket handling on the in-file path).
+          WHERE ( ncArr == HCO_MISSVAL .OR. ncArr2 == HCO_MISSVAL )
+             ncArr = HCO_MISSVAL
+          ELSEWHERE
+             ncArr = (wgt1 * ncArr) + (wgt2 * ncArr2)
+          END WHERE
 
           ! Verbose
           IF ( HcoState%Config%doVerbose ) THEN
@@ -969,6 +1224,10 @@ CONTAINS
     !-----------------------------------------------------------------
     ELSEIF ( Lct%Dct%Dta%CycleFlag == HCO_CFLAG_AVERG    .OR. &
              Lct%Dct%Dta%CycleFlag == HCO_CFLAG_RANGEAVG       ) THEN
+
+       ! Multi-year averaging is not covered by the bracket cache;
+       ! invalidate so the next refresh re-reads fresh.
+       useCache = .FALSE.
 
        ! cYr is the current simulation year
        CALL HcoClock_Get( HcoState%Clock, cYYYY=cYr, cMM=cMt, cDD=cDy, &
@@ -1572,6 +1831,33 @@ CONTAINS
              ENDIF
           ENDIF
        ENDIF
+    ENDIF
+
+    !-----------------------------------------------------------------
+    ! Update bracket-read cache. For INTER paths the raw slices are
+    ! already populated above and the recorded (srcFile, tidx1, tidx2)
+    ! drives the re-blend/slide decision on the next refresh. For
+    ! non-INTER paths the record is only used to report cache-miss
+    ! reasons in the verbose log. The cross-file INTER and
+    ! AVERG/RANGEAVG paths above clear useCache so the cache is
+    ! invalidated instead.
+    !-----------------------------------------------------------------
+    IF ( useCache ) THEN
+       Lct%Dct%Dta%CacheValid = .TRUE.
+       Lct%Dct%Dta%CacheSrc   = TRIM(srcFile)
+       Lct%Dct%Dta%CacheTidx1 = tidx1
+       Lct%Dct%Dta%CacheTidx2 = tidx2
+       Lct%Dct%Dta%CacheUnit  = TRIM(thisUnit)
+    ELSE
+       Lct%Dct%Dta%CacheValid = .FALSE.
+       Lct%Dct%Dta%CacheSrc   = ''
+       Lct%Dct%Dta%CacheTidx1 = -1
+       Lct%Dct%Dta%CacheTidx2 = -1
+       Lct%Dct%Dta%CacheUnit  = ''
+       IF ( ALLOCATED(Lct%Dct%Dta%CacheSlice1) )                      &
+            DEALLOCATE(Lct%Dct%Dta%CacheSlice1)
+       IF ( ALLOCATED(Lct%Dct%Dta%CacheSlice2) )                      &
+            DEALLOCATE(Lct%Dct%Dta%CacheSlice2)
     ENDIF
 
     !-----------------------------------------------------------------

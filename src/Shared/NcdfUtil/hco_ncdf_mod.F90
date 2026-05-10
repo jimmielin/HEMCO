@@ -713,7 +713,6 @@ CONTAINS
     CHARACTER(LEN=255)     :: a_name    ! netCDF attribute name
     CHARACTER(LEN=255)     :: a_val     ! netCDF attribute value
     INTEGER                :: a_type    ! netCDF attribute type
-    REAL*8                 :: corr      ! netCDF attribute value
 
     ! Arrays for netCDF start and count values
     INTEGER                :: I, nRead, l1, l2
@@ -739,11 +738,12 @@ CONTAINS
 
     ! Logicals
     LOGICAL                :: FlipZ
-    LOGICAL                :: ReadAtt
 
-    ! Missing value
+    ! Variable attributes (pre-fetched once at start of routine).
+    LOGICAL                :: HasScale, HasOffset, HasMiss, HasFill
+    REAL*8                 :: scaleVal, offsetVal
     REAL*8                 :: miss8
-    REAL*4                 :: miss4
+    REAL*4                 :: missAttr, fillAttr
     REAL*4                 :: MissValue
 
     ! Weights
@@ -837,12 +837,70 @@ CONTAINS
     if ( ntime  > 0 ) ndims = ndims + 1
     if ( arbdim > 0 ) ndims = ndims + 1
 
+    ! Variable name
+    v_name = TRIM(ncVar)
+
+    !-----------------------------------------------------------------
+    ! Pre-fetch variable attributes (scale_factor, add_offset,
+    ! missing_value, _FillValue). These are applied once to the final
+    ! ncArr after all slices have been read and (if applicable) time-
+    ! blended. Single-side-fill detection is handled by the OR-mask
+    ! blend in the cache-aware INTER paths in hcoio_read_std_mod.F90.
+    !-----------------------------------------------------------------
+    HasScale  = .FALSE.
+    HasOffset = .FALSE.
+    HasMiss   = .FALSE.
+    HasFill   = .FALSE.
+    scaleVal  = 1.0_8
+    offsetVal = 0.0_8
+    missAttr  = 0.0
+    fillAttr  = 0.0
+
+    a_name = "scale_factor"
+    IF ( Ncdoes_Attr_Exist( fId, TRIM(v_name), TRIM(a_name), a_type ) ) THEN
+       CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), scaleVal )
+       HasScale = .TRUE.
+    ENDIF
+
+    a_name = "add_offset"
+    IF ( Ncdoes_Attr_Exist( fId, TRIM(v_name), TRIM(a_name), a_type ) ) THEN
+       CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), offsetVal )
+       HasOffset = .TRUE.
+    ENDIF
+
+    IF ( PRESENT(MissVal) ) THEN
+       MissValue = MissVal
+    ELSE
+       MissValue = 0.0
+    ENDIF
+
+    a_name = "missing_value"
+    IF ( Ncdoes_Attr_Exist( fId, TRIM(v_name), TRIM(a_name), a_type ) ) THEN
+       IF ( a_type == NF90_REAL ) THEN
+          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), missAttr )
+          HasMiss = .TRUE.
+       ELSE IF ( a_type == NF90_DOUBLE ) THEN
+          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), miss8 )
+          missAttr = REAL( miss8 )
+          HasMiss = .TRUE.
+       ENDIF
+    ENDIF
+
+    a_name = "_FillValue"
+    IF ( Ncdoes_Attr_Exist( fId, TRIM(v_name), TRIM(a_name), a_type ) ) THEN
+       IF ( a_type == NF90_REAL ) THEN
+          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), fillAttr )
+          HasFill = .TRUE.
+       ELSE IF ( a_type == NF90_DOUBLE ) THEN
+          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), miss8 )
+          fillAttr = REAL( miss8 )
+          HasFill = .TRUE.
+       ENDIF
+    ENDIF
+
     !----------------------------------------
     ! Read array
     !----------------------------------------
-
-    ! Variable name
-    v_name = TRIM(ncVar)
 
     ! Allocate the output array
     ALLOCATE ( ncArr( nLon, nLat, ncLev, ncTime ) )
@@ -1141,73 +1199,28 @@ CONTAINS
     ENDIF
 
     ! ------------------------------------------
-    ! Eventually apply scale / offset factors
+    ! Apply missing-value/fill and scale/offset attributes to the final
+    ! ncArr. Per CF conventions missing_value/_FillValue are stored in
+    ! packed (raw) units, so they must be detected BEFORE scale_factor/
+    ! add_offset are applied; scaling is then restricted to non-missing
+    ! pixels so the MissValue sentinel is preserved.
+    ! For ApplyWeights reads this runs on the already-blended array;
+    ! dual-fill pixels match the raw fill value (w1+w2=1) and are
+    ! replaced with MissValue. Single-side-fill detection in the
+    ! cache-aware INTER path is handled by the OR-mask blend in
+    ! hcoio_read_std_mod.F90.
     ! ------------------------------------------
-
-    ! Check for scale factor
-    a_name  = "scale_factor"
-    ReadAtt = Ncdoes_Attr_Exist ( fId, TRIM(v_name), TRIM(a_name), a_type )
-
-    IF ( ReadAtt ) THEN
-       CALL NcGet_Var_Attributes(fId,TRIM(v_name),TRIM(a_name),corr)
-       ncArr(:,:,:,:) = ncArr(:,:,:,:) * corr
+    IF ( HasMiss ) THEN
+       WHERE ( ncArr == missAttr ) ncArr = MissValue
     ENDIF
-
-    ! Check for offset factor
-    a_name  = "add_offset"
-    ReadAtt = Ncdoes_Attr_Exist ( fId, TRIM(v_name), TRIM(a_name), a_type )
-
-    IF ( ReadAtt ) THEN
-       CALL NcGet_Var_Attributes(fId,TRIM(v_name),TRIM(a_name),corr)
-       ncArr(:,:,:,:) = ncArr(:,:,:,:) + corr
+    IF ( HasFill ) THEN
+       WHERE ( ncArr == fillAttr ) ncArr = MissValue
     ENDIF
-
-    ! ------------------------------------------
-    ! Check for filling values
-    ! NOTE: Test for REAL*4 and REAL*8
-    ! ------------------------------------------
-
-    ! Define missing value
-    IF ( PRESENT(MissVal) ) THEN
-       MissValue = MissVal
-    ELSE
-       MissValue = 0.0
+    IF ( HasScale ) THEN
+       WHERE ( ncArr /= MissValue ) ncArr(:,:,:,:) = ncArr(:,:,:,:) * scaleVal
     ENDIF
-
-    ! 1: 'missing_value'
-    a_name  = "missing_value"
-    ReadAtt = Ncdoes_Attr_Exist ( fId, TRIM(v_name), TRIM(a_name), a_type )
-    IF ( ReadAtt ) THEN
-       IF ( a_type == NF90_REAL ) THEN
-          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), miss4 )
-          WHERE ( ncArr == miss4 )
-             ncArr = MissValue
-          END WHERE
-       ELSE IF ( a_type == NF90_DOUBLE ) THEN
-          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), miss8 )
-          miss4 = REAL( miss8 )
-          WHERE ( ncArr == miss4 )
-             ncArr = MissValue
-          END WHERE
-       ENDIF
-    ENDIF
-
-    ! 2: '_FillValue'
-    a_name  = "_FillValue"
-    ReadAtt = Ncdoes_Attr_Exist ( fId, TRIM(v_name), TRIM(a_name), a_type )
-    IF ( ReadAtt ) THEN
-       IF ( a_type == NF90_REAL ) THEN
-          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), miss4 )
-          WHERE ( ncArr == miss4 )
-             ncArr = MissValue
-          END WHERE
-       ELSE IF ( a_type == NF90_DOUBLE ) THEN
-          CALL NcGet_Var_Attributes( fId, TRIM(v_name), TRIM(a_name), miss8 )
-          miss4 = REAL( miss8 )
-          WHERE ( ncArr == miss4 )
-             ncArr = MissValue
-          END WHERE
-       ENDIF
+    IF ( HasOffset ) THEN
+       WHERE ( ncArr /= MissValue ) ncArr(:,:,:,:) = ncArr(:,:,:,:) + offsetVal
     ENDIF
 
     ! ------------------------------------------
