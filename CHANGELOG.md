@@ -11,12 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added C-preprocessor switches `USE_ESMF` and `MAPL3`
 - Added HEMCO I/O module using PIO (`hcoio_read_pio_mod.F90` and `hcoio_write_pio_mod.F90` stub) for coupling to CESM
 - Added an extension for calculating GFAS 3D biomass emission
+- Added `hco_directregrid_mod.F90` owning the direct-to-model-grid regridding hook: the host model registers its regridding routine (e.g. ESMF-based) via `HCO_DirectRegrid_Register`, and `hcoio_read_pio_mod.F90` dispatches to it when `HcoDirectMode` is enabled. This supports regridding input data straight onto unstructured host grids (e.g. CAM physics grid on regionally-refined meshes), bypassing MAP_A2A/MESSy
+- Added nearest-column point-source lookup (`HCO_GetHorzIJIndex_Direct`, `MODEL_CESM` only) so extensions using `HCO_GetHorzIJIndex` (e.g. volcano) work in direct-to-model-grid mode; ownership across tasks is resolved collectively via an MPI reduction
 
 ### Changed
 - Renamed subroutine `HCO_CopyFromIntnal_ESMF` to `HCO_CopyFromInternal_ESMF`
 - Renamed state objects `HcoState%IMPORT` and `HcoStateEXPORT` to `HcoState%importState` and `HcoState%exportState` respectively
 
 ### Fixed
+- Fixed missing-value handling in `hcoio_read_pio_mod.F90` by re-enabling `CheckMissVal`, which is required for the direct regridding path (raw `HCO_MISSVAL` sentinels would otherwise be smeared into neighboring cells by conservative regridding)
+- Fixed GEOS-Chem model-level sigma edges in the direct regridding path: 72-level and reduced 47-level midpoint data are now handled with the correct edge tables (`ModelLev_EdgeSigma`), and unsupported level counts error out instead of silently using wrong or out-of-bounds sigma values
 - Fixed an error in `src/Shared/GeosUtil/hco_regrid_a2a_mod.F90` where an accumulator was uninitialized before reuse, which may inherit junk data from the previous iteration if the southmost source cell is not found
 - Fixed IF-block logic errors in `SrcFile_Parse` that led to incorrect time-cycling behavior
 

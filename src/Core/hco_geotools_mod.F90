@@ -658,6 +658,9 @@ CONTAINS
 ! !USES:
 !
     USE HCO_STATE_MOD,   ONLY : HCO_STATE
+#if defined( MODEL_CESM )
+    USE HCO_DirectRegrid_Mod, ONLY : HcoDirectMode
+#endif
 !
 ! !INPUT PARAMETERS:
 !
@@ -696,6 +699,21 @@ CONTAINS
     IDX(:) = -1
     JDX(:) = -1
     FOUND  =  0
+
+#if defined( MODEL_CESM )
+    !-----------------------------------------------------------------
+    ! Direct-to-model-grid mode: the HcoState grid is the host column
+    ! grid (NX = # columns on this task, NY = 1) with degenerate
+    ! XEDGE/YEDGE, so the box-membership search below cannot locate
+    ! any point. Find the nearest column by great-circle distance
+    ! instead, with a collective reduction so that exactly one task
+    ! globally owns each point (see HCO_GetHorzIJIndex_Direct).
+    !-----------------------------------------------------------------
+    IF ( HcoDirectMode ) THEN
+       CALL HCO_GetHorzIJIndex_Direct( HcoState, N, Lon, Lat, IDX, JDX, RC )
+       RETURN
+    ENDIF
+#endif
 
     ! do for every grid box
     DO J = 1, HcoState%NY
@@ -759,6 +777,150 @@ CONTAINS
 
   END SUBROUTINE HCO_GetHorzIJIndex
 !EOC
+#if defined( MODEL_CESM )
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: HCO_GetHorzIJIndex_Direct
+!
+! !DESCRIPTION: Subroutine HCO\_GetHorzIJIndex\_Direct returns, for each given
+!  longitude/latitude, the local index of the nearest host-model column in
+!  direct-to-model-grid mode (HcoState grid is NX = local columns, NY = 1).
+!
+!  Because each task only sees its own columns, the local nearest column is
+!  not necessarily the global nearest. Ownership is resolved collectively:
+!  every task computes its local best great-circle match, then an
+!  MPI\_MAXLOC allreduce over (cos distance, rank) selects exactly one owner
+!  per point (ties broken deterministically towards the lower rank). The
+!  owner returns the local column index; all other tasks return -1, matching
+!  the "point not on my domain" convention of the box-membership search.
+!
+!  This routine is collective: all tasks in the host communicator must call
+!  it with the same point list. This holds for the volcano extension, which
+!  reads the same point-source table on every task.
+!\\
+!\\
+! !INTERFACE:
+!
+  SUBROUTINE HCO_GetHorzIJIndex_Direct( HcoState, N, Lon, Lat, idx, jdx, RC )
+!
+! !USES:
+!
+    USE HCO_STATE_MOD,        ONLY : HCO_STATE
+    USE HCO_DirectRegrid_Mod, ONLY : HcoDirectComm
+    USE MPI
+!
+! !INPUT PARAMETERS:
+!
+    TYPE(HCO_State), POINTER        :: HcoState       ! HEMCO state object
+    INTEGER,         INTENT(IN   )  :: N
+    REAL(hp),        INTENT(IN   )  :: Lon(N)         ! [deg E]
+    REAL(hp),        INTENT(IN   )  :: Lat(N)         ! [deg N]
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    INTEGER,         INTENT(INOUT)  :: RC
+!
+! !OUTPUT PARAMETERS:
+!
+    INTEGER,         INTENT(  OUT)  :: IDX(N), JDX(N)
+!
+! !REVISION HISTORY:
+!  10 Jul 2026 - H.P. Lin - Initial version
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER               :: I, L, myRank, ierr
+    REAL(hp)              :: lonR, latR, sinLat, cosLat, cosDist
+    REAL(hp), ALLOCATABLE :: colLonR(:), colSinLat(:), colCosLat(:)
+    INTEGER,  ALLOCATABLE :: bestI(:)
+    ! (value, rank) pairs for the MPI_MAXLOC reduction
+    DOUBLE PRECISION, ALLOCATABLE :: locSend(:,:), locRecv(:,:)
+
+    REAL(hp), PARAMETER   :: PI_180 = 3.14159265358979323846_hp / 180.0_hp
+    CHARACTER(LEN=*), PARAMETER :: LOC = &
+       'HCO_GetHorzIJIndex_Direct (hco_geotools_mod.F90)'
+
+    ! Initialize
+    IDX(:) = -1
+    JDX(:) = -1
+
+    IF ( HcoDirectComm == -1 ) THEN
+       CALL HCO_ERROR( 'Direct-mode point source lookup requires the host'// &
+                       ' MPI communicator - pass mpiComm to'//               &
+                       ' HCO_DirectRegrid_Register at initialization.',      &
+                       RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+
+    CALL MPI_Comm_Rank( HcoDirectComm, myRank, ierr )
+    IF ( ierr /= MPI_SUCCESS ) THEN
+       CALL HCO_ERROR( 'MPI_Comm_Rank failed', RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+
+    ! Precompute column coordinates in radians. Any longitude convention
+    ! (-180..180 or 0..360) works since only differences enter COS below.
+    ALLOCATE( colLonR(HcoState%NX), colSinLat(HcoState%NX), &
+              colCosLat(HcoState%NX) )
+    DO I = 1, HcoState%NX
+       colLonR(I)   = HcoState%Grid%XMID%Val(I,1) * PI_180
+       latR         = HcoState%Grid%YMID%Val(I,1) * PI_180
+       colSinLat(I) = SIN( latR )
+       colCosLat(I) = COS( latR )
+    ENDDO
+
+    ! Local best match per point: maximize the cosine of the great-circle
+    ! distance (equivalent to minimizing the distance, without ACOS).
+    ALLOCATE( bestI(N), locSend(2,N), locRecv(2,N) )
+    DO L = 1, N
+       lonR   = Lon(L) * PI_180
+       latR   = Lat(L) * PI_180
+       sinLat = SIN( latR )
+       cosLat = COS( latR )
+
+       bestI(L)     = -1
+       locSend(1,L) = -2.0d0     ! < min possible cos distance (-1)
+       locSend(2,L) = DBLE( myRank )
+       DO I = 1, HcoState%NX
+          cosDist = sinLat*colSinLat(I) + &
+                    cosLat*colCosLat(I)*COS( lonR - colLonR(I) )
+          IF ( cosDist > locSend(1,L) ) THEN
+             locSend(1,L) = cosDist
+             bestI(L)     = I
+          ENDIF
+       ENDDO
+    ENDDO
+
+    ! Global owner selection
+    CALL MPI_Allreduce( locSend, locRecv, N, MPI_2DOUBLE_PRECISION, &
+                        MPI_MAXLOC, HcoDirectComm, ierr )
+    IF ( ierr /= MPI_SUCCESS ) THEN
+       DEALLOCATE( colLonR, colSinLat, colCosLat, bestI, locSend, locRecv )
+       CALL HCO_ERROR( 'MPI_Allreduce failed', RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+
+    DO L = 1, N
+       IF ( NINT( locRecv(2,L) ) == myRank .AND. bestI(L) > 0 ) THEN
+          IDX(L) = bestI(L)
+          JDX(L) = 1
+       ENDIF
+    ENDDO
+
+    DEALLOCATE( colLonR, colSinLat, colCosLat, bestI, locSend, locRecv )
+
+    ! Return w/ success
+    RC = HCO_SUCCESS
+
+  END SUBROUTINE HCO_GetHorzIJIndex_Direct
+!EOC
+#endif
 #endif
 !------------------------------------------------------------------------------
 !                   Harmonized Emissions Component (HEMCO)                    !

@@ -140,7 +140,7 @@ CONTAINS
     USE HCOIO_MESSY_MOD,    ONLY : HCO_MESSY_REGRID
     USE HCO_INTERP_MOD,     ONLY : REGRID_MAPA2A
     USE HCO_INTERP_MOD,     ONLY : ModelLev_Check
-    USE hco_esmf_regrid_cache, ONLY : HcoDirectMode, HCO_ESMF_REGRID_DIRECT
+    USE HCO_DirectRegrid_Mod, ONLY : HcoDirectMode, HCO_DirectRegrid_Run
     USE HCO_CLOCK_MOD,      ONLY : HcoClock_Get
     USE HCO_DIAGN_MOD,      ONLY : Diagn_Update
     USE HCO_EXTLIST_MOD,    ONLY : HCO_GetOpt
@@ -187,6 +187,7 @@ CONTAINS
     REAL(sp), POINTER             :: ncArr2(:,:,:,:)
     REAL(hp), POINTER             :: SigEdge(:,:,:)
     REAL(hp), POINTER             :: SigLev (:,:,:)
+    REAL(hp), ALLOCATABLE         :: SigEdgeCol(:)
     REAL(hp), POINTER             :: LonMid   (:)
     REAL(hp), POINTER             :: LatMid   (:)
     REAL(hp), POINTER             :: LevMid   (:)
@@ -1398,14 +1399,26 @@ CONTAINS
        ! data, we replicate the same SigEdge preparation here.
        IF ( nlev > 1 ) THEN
 #if defined( MODEL_CESM ) || defined( MODEL_WRF )
-          ! For GEOS-Chem level data, build SigEdge from hardcoded table
+          ! For GEOS-Chem level data, build SigEdge from the hardcoded
+          ! sigma tables. Only midpoint-level data on the standard 72-level
+          ! or reduced 47-level GEOS-Chem grids is supported; other level
+          ! counts accepted by the IsModelLevel detection (e.g. 73/48
+          ! interface data) error out inside ModelLev_EdgeSigma.
           IF ( IsModelLevel ) THEN
+             ALLOCATE(SigEdgeCol(nlev+1))
+             CALL ModelLev_EdgeSigma( nlev, SigEdgeCol, RC )
+             IF ( RC /= HCO_SUCCESS ) THEN
+                CALL HCO_ERROR( 'ERROR in ModelLev_EdgeSigma for '// &
+                                TRIM(srcFile), RC, THISLOC=LOC )
+                RETURN
+             ENDIF
              ALLOCATE(SigEdge(nlon, nlat, nlev+1))
              DO I = 1, nlon
                 DO J = 1, nlat
-                   SigEdge(I, J, :) = GC_72_EDGE_SIGMA(1:nlev+1)
+                   SigEdge(I, J, :) = SigEdgeCol(1:nlev+1)
                 ENDDO
              ENDDO
+             DEALLOCATE(SigEdgeCol)
           ENDIF
 #endif
           ! For real-coordinate data, read sigma from file
@@ -1443,11 +1456,12 @@ CONTAINS
           ENDIF
        ENDIF
 
-       ! Call the ESMF direct regridding dispatch
-       CALL HCO_ESMF_REGRID_DIRECT( HcoState, NcArr, LonEdge, LatEdge, &
-                                    SigEdge, Lct, IsModelLevel, RC )
+       ! Dispatch to the host-registered direct regridding routine
+       ! (see hco_directregrid_mod.F90 for the interface contract).
+       CALL HCO_DirectRegrid_Run( HcoState, NcArr, LonEdge, LatEdge, &
+                                  SigEdge, Lct, RC )
        IF ( RC /= HCO_SUCCESS ) THEN
-          CALL HCO_ERROR( 'ERROR in HCO_ESMF_REGRID_DIRECT', RC, THISLOC=LOC )
+          CALL HCO_ERROR( 'ERROR in HCO_DirectRegrid_Run', RC, THISLOC=LOC )
           RETURN
        ENDIF
 
@@ -1744,6 +1758,78 @@ CONTAINS
     ENDIF
 
  END FUNCTION IO_ErrMsg
+!EOC
+!------------------------------------------------------------------------------
+!                   Harmonized Emissions Component (HEMCO)                    !
+!------------------------------------------------------------------------------
+!BOP
+!
+! !IROUTINE: ModelLev_EdgeSigma
+!
+! !DESCRIPTION: Subroutine ModelLev\_EdgeSigma returns the nlev+1 sigma
+!  interface values for data on GEOS-Chem model levels, ordered surface
+!  (sigma~1) to top. Supported level counts are the standard 72-level grid
+!  and the reduced 47-level grid, whose edges are a subset of the 72-level
+!  edges (native below level 36, lumped 2x for the next 4 levels and 4x
+!  above). Any other level count is an error: in particular, interface
+!  (73/48-level) data cannot be represented by these midpoint-layer tables.
+!\\
+!\\
+! !INTERFACE:
+!
+ SUBROUTINE ModelLev_EdgeSigma( nlev, EdgeSigma, RC )
+!
+! !INPUT PARAMETERS:
+!
+    INTEGER,  INTENT(IN   )  :: nlev                ! # of data levels
+!
+! !INPUT/OUTPUT PARAMETERS:
+!
+    INTEGER,  INTENT(INOUT)  :: RC                  ! Return code
+!
+! !OUTPUT PARAMETERS:
+!
+    REAL(hp), INTENT(  OUT)  :: EdgeSigma(nlev+1)   ! Sigma at interfaces
+!
+! !REVISION HISTORY:
+!  10 Jul 2026 - H.P. Lin - Initial version
+!EOP
+!------------------------------------------------------------------------------
+!BOC
+!
+! !LOCAL VARIABLES:
+!
+    INTEGER :: L
+    CHARACTER(LEN=255) :: MSG
+    CHARACTER(LEN=255) :: LOC = 'ModelLev_EdgeSigma (hcoio_read_pio_mod.F90)'
+
+    ! Indices of the 47-level reduced-grid edges within the 72-level
+    ! edge table: native through edge 37, then lumped 2x (4 layers) and
+    ! lumped 4x (7 layers) up to the model top.
+    INTEGER, PARAMETER :: GC_47_EDGE_INDEX(48) = (/                          &
+        1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16,      &
+       17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,      &
+       33, 34, 35, 36, 37, 39, 41, 43, 45, 49, 53, 57, 61, 65, 69, 73 /)
+
+    IF ( nlev == 72 ) THEN
+       EdgeSigma(1:73) = GC_72_EDGE_SIGMA(1:73)
+    ELSE IF ( nlev == 47 ) THEN
+       DO L = 1, 48
+          EdgeSigma(L) = GC_72_EDGE_SIGMA( GC_47_EDGE_INDEX(L) )
+       ENDDO
+    ELSE
+       WRITE(MSG,'(a,i0,a)')                                                 &
+          'GEOS-Chem model-level data with ', nlev,                         &
+          ' levels is not supported in direct regridding mode - only'    // &
+          ' 72-level and reduced 47-level midpoint data is. Regrid the'  // &
+          ' input file or disable direct mode for this configuration.'
+       CALL HCO_ERROR( MSG, RC, THISLOC=LOC )
+       RETURN
+    ENDIF
+
+    RC = HCO_SUCCESS
+
+ END SUBROUTINE ModelLev_EdgeSigma
 !EOC
 END MODULE HCOIO_Read_Mod
 #endif
